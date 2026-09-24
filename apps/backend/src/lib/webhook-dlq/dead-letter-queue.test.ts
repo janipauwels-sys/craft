@@ -26,6 +26,11 @@ afterEach(() => {
     vi.restoreAllMocks();
 });
 
+// Helper to create test entry
+function createDLQEntry(source: 'stripe' | 'github' = 'stripe') {
+    return webhookDLQ.capture(source, 'test.event', '{"test":true}', 'test failure', 1);
+}
+
 describe('webhookDLQ.scheduleRetry()', () => {
     it('succeeds on first retry attempt', async () => {
         const processor = vi.fn().mockResolvedValue(undefined);
@@ -270,5 +275,97 @@ describe('webhookDLQ dedup index pruning', () => {
 
         webhookDLQ._reset();
         expect(webhookDLQ._dedupIndexSize()).toBe(0);
+    });
+});
+
+describe('webhookDLQ.reprocess() concurrent protection', () => {
+    beforeEach(() => {
+        webhookDLQ._reset();
+    });
+
+    afterEach(() => {
+        webhookDLQ._reset();
+        vi.restoreAllMocks();
+    });
+
+    it('executes a reprocess request exactly once even with simultaneous concurrent calls', async () => {
+        let processorExecutionCount = 0;
+        const processor = vi.fn().mockImplementation(async () => {
+            processorExecutionCount++;
+            await new Promise((resolve) => setTimeout(resolve, 5));
+        });
+        webhookDLQ.registerProcessor('stripe', processor);
+
+        const entry = createDLQEntry('stripe');
+
+        // Fire two reprocess requests concurrently for the same entry
+        const [result1, result2] = await Promise.all([
+            webhookDLQ.reprocess(entry.id),
+            webhookDLQ.reprocess(entry.id),
+        ]);
+
+        // Exactly one should succeed; the other should report already-in-progress or already-succeeded
+        const successCount = [result1.success, result2.success].filter(Boolean).length;
+        expect(successCount).toBe(1);
+
+        // The processor should have been called exactly once
+        expect(processorExecutionCount).toBe(1);
+    });
+
+    it('returns distinguishable error when entry is already being reprocessed', async () => {
+        const processor = vi.fn().mockImplementation(async () => {
+            await new Promise((resolve) => setTimeout(resolve, 10));
+        });
+        webhookDLQ.registerProcessor('stripe', processor);
+
+        const entry = createDLQEntry('stripe');
+
+        const [result1, result2] = await Promise.all([
+            webhookDLQ.reprocess(entry.id),
+            webhookDLQ.reprocess(entry.id),
+        ]);
+
+        // One succeeds, one fails with a clear error message
+        if (result1.success) {
+            expect(result2.success).toBe(false);
+            expect(result2.error).toContain('already');
+        } else {
+            expect(result2.success).toBe(true);
+            expect(result1.error).toContain('already');
+        }
+    });
+
+    it('does not require a separate pre-check before reprocess()', async () => {
+        const processor = vi.fn().mockResolvedValue(undefined);
+        webhookDLQ.registerProcessor('stripe', processor);
+
+        const entry = createDLQEntry('stripe');
+
+        // Call reprocess without prior get() — it should be atomic
+        const result = await webhookDLQ.reprocess(entry.id);
+        expect(result.success).toBe(true);
+    });
+
+    it('returns not-found error when entry does not exist', async () => {
+        const result = await webhookDLQ.reprocess('nonexistent-id');
+        expect(result.success).toBe(false);
+        expect(result.error).toContain('not found');
+    });
+
+    it('maintains consistent state under concurrent reprocess attempts', async () => {
+        const processor = vi.fn().mockResolvedValue(undefined);
+        webhookDLQ.registerProcessor('stripe', processor);
+
+        const entry = createDLQEntry('stripe');
+
+        await Promise.all([
+            webhookDLQ.reprocess(entry.id),
+            webhookDLQ.reprocess(entry.id),
+        ]);
+
+        const finalEntry = webhookDLQ.get(entry.id);
+        expect(finalEntry).toBeDefined();
+        expect(finalEntry!.reprocessStatus).toBe('succeeded');
+        expect(finalEntry!.reprocessedAt).toBeDefined();
     });
 });
